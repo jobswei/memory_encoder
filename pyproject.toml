@@ -17,6 +17,7 @@ dependencies = [
 svd = ["diffusers>=0.25"]
 safetensors = ["safetensors>=0.4"]
 test = ["pytest>=7"]
+example = ["decord>=0.6", "pillow>=10", "imageio[ffmpeg]>=2"]
 
 [tool.setuptools.packages.find]
 include = ["memory_encoder*"]

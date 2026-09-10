@@ -13,11 +13,12 @@ def load_svd_vae(
 ) -> torch.nn.Module:
     from diffusers import AutoencoderKLTemporalDecoder
 
-    return AutoencoderKLTemporalDecoder.from_pretrained(
+    vae = AutoencoderKLTemporalDecoder.from_pretrained(
         str(vae_path),
         subfolder="vae",
         torch_dtype=torch_dtype,
-    ).to(device=device)
+    )
+    return vae.to(device=device)
 
 
 def encode_svd_frames(

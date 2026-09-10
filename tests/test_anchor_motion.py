@@ -81,6 +81,7 @@ def test_checkpoint_roundtrip(tmp_path: Path) -> None:
     loaded_model = AnchorMotionAutoEncoder.from_pretrained(
         checkpoint_directory
     )
+    assert (checkpoint_directory / "config.yaml").exists()
     anchor_latent = torch.randn(1, 8, 4, 5)
     target_latents = torch.randn(1, 2, 8, 4, 5)
     model.eval()

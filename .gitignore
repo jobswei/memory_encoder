@@ -6,3 +6,5 @@ dist/
 *.egg-info/
 *.safetensors
 *.pt
+work_dirs
+work_dirs

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 from typing import Any
@@ -8,28 +7,24 @@ from typing import Any
 import einops
 import torch
 import torch.nn as nn
+import yaml
 
 from .config import AnchorMotionConfig
 
 
 def _load_checkpoint_config(checkpoint_directory: Path) -> dict[str, Any]:
     config_paths = [
-        checkpoint_directory / "config.json",
         checkpoint_directory / "config.yaml",
         checkpoint_directory.parent / "config.yaml",
     ]
     for config_path in config_paths:
         if not config_path.exists():
             continue
-        if config_path.suffix == ".json":
-            return json.loads(config_path.read_text(encoding="utf-8"))
-        import yaml
-
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         return config.get("model", config)
     raise FileNotFoundError(
-        "Missing model config; expected config.json or config.yaml in "
-        f"{checkpoint_directory}, or config.yaml in its parent directory"
+        "Missing model config; expected config.yaml in "
+        f"{checkpoint_directory}, or in its parent directory"
     )
 
 
@@ -421,8 +416,8 @@ class AnchorMotionAutoEncoder(nn.Module):
     def save_pretrained(self, directory: str | Path) -> None:
         output_directory = Path(directory)
         output_directory.mkdir(parents=True, exist_ok=True)
-        (output_directory / "config.json").write_text(
-            json.dumps(self.config.to_dict(), indent=2),
+        (output_directory / "config.yaml").write_text(
+            yaml.safe_dump(self.config.to_dict(), sort_keys=False),
             encoding="utf-8",
         )
         try:

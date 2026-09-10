@@ -45,7 +45,7 @@ class AnchorMotionVideoAutoEncoder(nn.Module):
         )
         return cls(
             anchor_motion.to(device=device, dtype=torch_dtype),
-            vae.to(device=device, dtype=torch_dtype),
+            vae,
             encode_batch_size=encode_batch_size,
         )
 

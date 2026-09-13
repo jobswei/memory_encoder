@@ -196,9 +196,15 @@ class AnchorMotionVideoAutoEncoder(nn.Module):
                 frames,
                 self.encode_batch_size,
             )
+        frame_indices = self.temporal_compression * torch.arange(
+            1,
+            latents.shape[1],
+            device=latents.device,
+        )[None, :].expand(latents.shape[0], -1)
         motion_tokens = self.anchor_motion.encode(
             latents[:, 0],
             latents[:, 1:],
+            frame_indices,
         )
         return {
             "anchor_latent": latents[:, 0].contiguous(),

@@ -176,3 +176,57 @@ def test_wan22_video_autoencoder_accepts_raw_video() -> None:
     assert memory["anchor_latent"].shape == (1, 3, 2, 2)
     assert memory["motion_tokens"].shape == (1, 2, 2, 16)
     assert reconstructed_video.shape == (1, 9, 32, 32, 3)
+
+
+def test_wan22_video_autoencoder_uses_latent_frame_indices() -> None:
+    class FrameIndexSpy(AnchorMotionAutoEncoder):
+
+        def __init__(self) -> None:
+            super().__init__(
+                AnchorMotionConfig(
+                    latent_channels=3,
+                    hidden_dim=16,
+                    num_motion_tokens=2,
+                    num_layers=1,
+                    num_heads=2,
+                    num_position_harmonics=1,
+                )
+            )
+            self.frame_indices = None
+
+        def encode(
+            self,
+            anchor_latent: torch.Tensor,
+            target_latents: torch.Tensor,
+            frame_indices: torch.Tensor | None = None,
+            target_padding_mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            self.frame_indices = frame_indices
+            batch_size, num_targets = target_latents.shape[:2]
+            return torch.zeros(
+                batch_size,
+                num_targets,
+                self.config.num_motion_tokens,
+                self.config.hidden_dim,
+            )
+
+    anchor_motion = FrameIndexSpy()
+    model = AnchorMotionVideoAutoEncoder(
+        anchor_motion,
+        FakeWan22VAE(),
+        encode_batch_size=1,
+        vae_type="wan22",
+    )
+    video = torch.randint(
+        0,
+        256,
+        (1, 13, 32, 32, 3),
+        dtype=torch.uint8,
+    )
+
+    model.encode_video(video)
+
+    assert torch.equal(
+        anchor_motion.frame_indices,
+        torch.tensor([[4, 8, 12]]),
+    )

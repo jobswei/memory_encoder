@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--vae-path",
         type=Path,
         required=True,
-        help="Stable Video Diffusion checkpoint directory.",
+        help="Base VAE checkpoint directory or file.",
     )
     parser.add_argument(
         "--output",
@@ -168,8 +168,9 @@ def main() -> None:
         memory = model.encode_video(video)
         reconstructed_video = model.decode_video(
             memory["anchor_latent"],
-            memory["motion_tokens"],
-        )
+        memory["motion_tokens"],
+        num_frames=video.shape[0],
+    )
 
     anchor_latent = memory["anchor_latent"]
     motion_tokens = memory["motion_tokens"]

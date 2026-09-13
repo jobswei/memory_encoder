@@ -9,12 +9,13 @@ description = "Anchor-frame motion encoder for world-model history compression"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.1",
+  "diffusers @ git+https://github.com/huggingface/diffusers.git@717f9031f13b1ed0b2c22bfa8eb02a7ec74a8d4f",
   "einops>=0.7",
   "pyyaml>=6.0",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
-svd = ["diffusers>=0.25"]
 safetensors = ["safetensors>=0.4"]
 test = ["pytest>=7"]
 example = ["decord>=0.6", "pillow>=10", "imageio[ffmpeg]>=2"]

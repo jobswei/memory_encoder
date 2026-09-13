@@ -11,6 +11,18 @@ from memory_encoder import (
     AnchorMotionVideoAutoEncoder,
     encode_svd_frames,
 )
+from memory_encoder.video_autoencoder import _resolve_vae_type
+
+
+class FakeCheckpointWanVAE(torch.nn.Module):
+
+    device = torch.device("cpu")
+    dtype = torch.float32
+    config = type(
+        "Config",
+        (),
+        {"scale_factor_temporal": 4, "scale_factor_spatial": 8},
+    )()
 
 
 def build_model() -> AnchorMotionAutoEncoder:
@@ -177,8 +189,88 @@ def test_video_autoencoder_accepts_raw_video() -> None:
         outputs["motion_tokens"],
     )
     assert reconstructed_video.shape == (2, 5, 8, 6, 3)
-
     single_video = video[0]
     single_outputs = model.encode_video(single_video)
     assert single_outputs["anchor_latent"].shape == (1, 8, 8, 6)
     assert single_outputs["motion_tokens"].shape == (1, 4, 4, 32)
+
+
+def test_video_autoencoder_detects_wan_training_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model = build_model()
+    training_output = tmp_path / "training_output"
+    checkpoint_directory = training_output / "checkpoint-1"
+    checkpoint_directory.mkdir(parents=True)
+    torch.save(model.state_dict(), checkpoint_directory / "model.pt")
+    with (training_output / "config.yaml").open("w") as file:
+        yaml.safe_dump(
+            {
+                "model": {
+                    **model.config.to_dict(),
+                    "base_vae_type": "wan",
+                }
+            },
+            file,
+        )
+
+    monkeypatch.setattr(
+        "memory_encoder.video_autoencoder.load_wan_vae",
+        lambda _path, device, torch_dtype: FakeCheckpointWanVAE(),
+    )
+    loaded_model = AnchorMotionVideoAutoEncoder.from_pretrained(
+        checkpoint_directory,
+        vae_path="fake-wan-vae",
+    )
+
+    assert loaded_model.vae_type == "wan"
+
+
+def test_base_vae_type_is_inferred_from_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def build_checkpoint(input_channels: int) -> torch.Tensor:
+        return {
+            "encoder.conv1.weight": torch.zeros(
+                1,
+                input_channels,
+                1,
+                1,
+                1,
+            )
+        }
+
+    wan_path = tmp_path / "Wan_VAE.pth"
+    wan22_path = tmp_path / "vae.pt"
+    wan_path.touch()
+    wan22_path.touch()
+    monkeypatch.setattr(
+        "memory_encoder.video_autoencoder.torch.load",
+        lambda path, map_location, weights_only: build_checkpoint(
+            3 if Path(path) == wan_path else 12
+        ),
+    )
+    assert _resolve_vae_type({}, wan_path) == "wan"
+    assert _resolve_vae_type({}, wan22_path) == "wan22"
+
+    diffusers_wan = tmp_path / "wan-diffusers"
+    (diffusers_wan / "vae").mkdir(parents=True)
+    (diffusers_wan / "vae" / "config.json").write_text(
+        '{"_class_name": "AutoencoderKLWan"}',
+        encoding="utf-8",
+    )
+    diffusers_svd = tmp_path / "svd"
+    diffusers_svd.mkdir()
+    (diffusers_svd / "config.json").write_text(
+        '{"_class_name": "AutoencoderKLTemporalDecoder"}',
+        encoding="utf-8",
+    )
+
+    assert _resolve_vae_type({}, diffusers_wan) == "wan"
+    assert _resolve_vae_type({}, diffusers_svd) == "svd"
+    assert _resolve_vae_type({"base_vae_type": "wan22"}, wan_path) == "wan22"
+
+    with pytest.raises(ValueError, match="infer the base VAE type"):
+        _resolve_vae_type({}, tmp_path / "unknown")

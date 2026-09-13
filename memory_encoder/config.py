@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -13,6 +13,11 @@ class AnchorMotionConfig:
     num_heads: int = 8
     num_position_harmonics: int = 8
     dropout: float = 0.0
+    temporal_attention: str = "none"
+    temporal_insertion_indices: list[int] = field(
+        default_factory=lambda: [2, 3],
+    )
+    anchor_context_size: int = 4
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

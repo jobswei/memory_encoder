@@ -157,10 +157,83 @@ class MotionEncoderBlock(nn.Module):
         return queries + self.feed_forward(queries)
 
 
+class AnchorContextProjection(nn.Module):
+
+    def __init__(
+        self,
+        latent_channels: int,
+        hidden_dim: int,
+        context_size: int,
+    ) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Conv2d(latent_channels, hidden_dim, 3, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d((context_size, context_size)),
+            nn.Conv2d(hidden_dim, hidden_dim, 1),
+            nn.SiLU(),
+        )
+
+    def forward(self, anchor_latent: torch.Tensor) -> torch.Tensor:
+        features = self.network(anchor_latent)
+        return einops.rearrange(
+            features,
+            "b d h w -> b (h w) d",
+        )
+
+
+class CausalTemporalMotionBlock(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.feed_forward = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        anchor_tokens: torch.Tensor,
+        attention_mask: torch.Tensor,
+        key_padding_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        context = torch.cat([anchor_tokens, queries], dim=1)
+        normalized_queries = self.query_norm(queries)
+        normalized_context = self.context_norm(context)
+        hidden = queries + self.attention(
+            normalized_queries,
+            normalized_context,
+            normalized_context,
+            attn_mask=attention_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )[0]
+        return hidden + self.feed_forward(hidden)
+
+
 class AnchorMotionEncoder(nn.Module):
 
     def __init__(self, config: AnchorMotionConfig) -> None:
         super().__init__()
+        self.num_motion_tokens = config.num_motion_tokens
+        self.anchor_context_size = config.anchor_context_size
         self.input_projection = nn.Sequential(
             nn.Conv2d(config.latent_channels, 64, 3, padding=1),
             nn.SiLU(),
@@ -188,12 +261,79 @@ class AnchorMotionEncoder(nn.Module):
             )
             for _ in range(config.num_layers)
         )
+        self.temporal_attention = config.temporal_attention
+        self.temporal_insertion_indices = tuple(
+            config.temporal_insertion_indices,
+        )
+        if self.temporal_attention != "none":
+            self.anchor_context_projection = AnchorContextProjection(
+                latent_channels=config.latent_channels,
+                hidden_dim=config.hidden_dim,
+                context_size=config.anchor_context_size,
+            )
+            self.temporal_blocks = nn.ModuleList(
+                CausalTemporalMotionBlock(
+                    hidden_dim=config.hidden_dim,
+                    num_heads=config.num_heads,
+                    dropout=config.dropout,
+                )
+                for _ in self.temporal_insertion_indices
+            )
+
+    @staticmethod
+    def _build_causal_attention_mask(
+        num_targets: int,
+        num_motion_tokens: int,
+        num_anchor_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        query_frames = torch.arange(num_targets, device=device)
+        query_frames = einops.repeat(
+            query_frames,
+            "t -> (t k)",
+            k=num_motion_tokens,
+        )
+        key_frames = torch.arange(num_targets, device=device)
+        key_frames = einops.repeat(
+            key_frames,
+            "t -> (t k)",
+            k=num_motion_tokens,
+        )
+        anchor_frames = torch.full(
+            (num_anchor_tokens,),
+            -1,
+            device=device,
+        )
+        key_frames = torch.cat([anchor_frames, key_frames])
+        return key_frames[None, :] > query_frames[:, None]
+
+    @staticmethod
+    def _build_context_padding_mask(
+        target_padding_mask: torch.Tensor | None,
+        num_motion_tokens: int,
+        num_anchor_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if target_padding_mask is None:
+            return None
+        motion_padding = einops.repeat(
+            target_padding_mask.to(device=device, dtype=torch.bool),
+            "b t -> b (t k)",
+            k=num_motion_tokens,
+        )
+        anchor_padding = torch.zeros(
+            (target_padding_mask.shape[0], num_anchor_tokens),
+            device=device,
+            dtype=torch.bool,
+        )
+        return torch.cat([anchor_padding, motion_padding], dim=1)
 
     def forward(
         self,
         anchor_latent: torch.Tensor,
         target_latents: torch.Tensor,
         frame_indices: torch.Tensor | None = None,
+        target_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, num_targets, _, height, width = target_latents.shape
         differences = target_latents - anchor_latent[:, None]
@@ -231,8 +371,55 @@ class AnchorMotionEncoder(nn.Module):
             "b t d -> (b t) 1 d",
         )
         queries = queries + frame_embeddings
-        for block in self.blocks:
+        anchor_tokens = None
+        attention_mask = None
+        context_padding_mask = None
+        if self.temporal_attention != "none":
+            anchor_tokens = self.anchor_context_projection(anchor_latent)
+            attention_mask = self._build_causal_attention_mask(
+                num_targets=num_targets,
+                num_motion_tokens=self.num_motion_tokens,
+                num_anchor_tokens=anchor_tokens.shape[1],
+                device=queries.device,
+            )
+            anchor_tokens = anchor_tokens + self.position_encoder.grid(
+                batch_size=batch_size,
+                height=self.anchor_context_size,
+                width=self.anchor_context_size,
+                device=anchor_tokens.device,
+                dtype=anchor_tokens.dtype,
+            )
+            context_padding_mask = self._build_context_padding_mask(
+                target_padding_mask,
+                num_motion_tokens=self.num_motion_tokens,
+                num_anchor_tokens=anchor_tokens.shape[1],
+                device=queries.device,
+            )
+
+        temporal_block_index = 0
+        for layer_index, block in enumerate(self.blocks):
             queries = block(queries, tokens)
+            if layer_index not in self.temporal_insertion_indices:
+                continue
+            motion_queries = einops.rearrange(
+                queries,
+                "(b t) k d -> b (t k) d",
+                b=batch_size,
+                t=num_targets,
+            )
+            motion_queries = self.temporal_blocks[temporal_block_index](
+                motion_queries,
+                anchor_tokens,
+                attention_mask,
+                context_padding_mask,
+            )
+            temporal_block_index += 1
+            queries = einops.rearrange(
+                motion_queries,
+                "b (t k) d -> (b t) k d",
+                b=batch_size,
+                t=num_targets,
+            )
         return einops.rearrange(
             queries,
             "(b t) k d -> b t k d",
@@ -362,6 +549,7 @@ class AnchorMotionAutoEncoder(nn.Module):
             "num_layers",
             "num_heads",
             "num_position_harmonics",
+            "anchor_context_size",
         )
         for field_name in positive_fields:
             if getattr(config, field_name) <= 0:
@@ -370,12 +558,31 @@ class AnchorMotionAutoEncoder(nn.Module):
             raise ValueError("dropout must be in [0.0, 1.0)")
         if config.hidden_dim % config.num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
+        if config.temporal_attention not in {"none", "anchor_conditioned"}:
+            raise ValueError(
+                "temporal_attention must be none or anchor_conditioned"
+            )
+        if config.temporal_attention == "none":
+            return
+        insertion_indices = config.temporal_insertion_indices
+        if not insertion_indices or len(set(insertion_indices)) != len(
+            insertion_indices
+        ):
+            raise ValueError(
+                "temporal_insertion_indices must contain unique values",
+            )
+        if any(
+            index < 0 or index >= config.num_layers
+            for index in insertion_indices
+        ):
+            raise ValueError("temporal insertion index is out of range")
 
     def encode(
         self,
         anchor_latent: torch.Tensor,
         target_latents: torch.Tensor,
         frame_indices: torch.Tensor | None = None,
+        target_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if anchor_latent.dim() != 4 or target_latents.dim() != 5:
             raise ValueError(
@@ -386,7 +593,17 @@ class AnchorMotionAutoEncoder(nn.Module):
             raise ValueError("target_latents and anchor_latent shapes must match")
         if frame_indices is not None and frame_indices.shape != target_latents.shape[:2]:
             raise ValueError("frame_indices must have shape [B, T]")
-        return self.encoder(anchor_latent, target_latents, frame_indices)
+        if (
+            target_padding_mask is not None
+            and target_padding_mask.shape != target_latents.shape[:2]
+        ):
+            raise ValueError("target_padding_mask must have shape [B, T]")
+        return self.encoder(
+            anchor_latent,
+            target_latents,
+            frame_indices,
+            target_padding_mask,
+        )
 
     def decode(
         self,
@@ -405,8 +622,14 @@ class AnchorMotionAutoEncoder(nn.Module):
         anchor_latent: torch.Tensor,
         target_latents: torch.Tensor,
         frame_indices: torch.Tensor | None = None,
+        target_padding_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        motion_tokens = self.encode(anchor_latent, target_latents, frame_indices)
+        motion_tokens = self.encode(
+            anchor_latent,
+            target_latents,
+            frame_indices,
+            target_padding_mask,
+        )
         reconstructed_latents = self.decode(anchor_latent, motion_tokens)
         return {
             "motion_tokens": motion_tokens,

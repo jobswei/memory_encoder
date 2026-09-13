@@ -82,6 +82,9 @@ from `model.base_vae_type` in the training config, or from the base VAE
 checkpoint/config when that field is absent. The package also includes minimal
 official SVD/Wan VAE adapters shared by this raw-video API and the host
 framework's cache preparation.
+Checkpoints can optionally enable anchor-conditioned interleaved causal
+attention through their saved model config; the raw-video and latent APIs do not
+change.
 Dataset, cache, and training implementations remain outside this repository.
 
 ### Latent API

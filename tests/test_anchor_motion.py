@@ -38,6 +38,22 @@ def build_model() -> AnchorMotionAutoEncoder:
     )
 
 
+def build_temporal_model() -> AnchorMotionAutoEncoder:
+    return AnchorMotionAutoEncoder(
+        AnchorMotionConfig(
+            latent_channels=8,
+            hidden_dim=32,
+            num_motion_tokens=4,
+            num_layers=2,
+            num_heads=4,
+            num_position_harmonics=2,
+            temporal_attention="anchor_conditioned",
+            temporal_insertion_indices=[1],
+            anchor_context_size=2,
+        )
+    )
+
+
 def test_forward_shapes() -> None:
     model = build_model()
     anchor_latent = torch.randn(2, 8, 6, 8)
@@ -47,6 +63,74 @@ def test_forward_shapes() -> None:
     assert outputs["motion_tokens"].shape == (2, 4, 4, 32)
     assert outputs["reconstructed_latents"].shape == (2, 4, 8, 6, 8)
     assert torch.isfinite(outputs["reconstructed_latents"]).all()
+
+
+def test_temporal_attention_forward_shapes() -> None:
+    model = build_temporal_model().eval()
+    anchor_latent = torch.randn(2, 8, 6, 8)
+    target_latents = torch.randn(2, 4, 8, 6, 8)
+
+    outputs = model(anchor_latent, target_latents)
+
+    assert outputs["motion_tokens"].shape == (2, 4, 4, 32)
+    assert outputs["reconstructed_latents"].shape == (2, 4, 8, 6, 8)
+    assert torch.isfinite(outputs["motion_tokens"]).all()
+
+
+def test_temporal_attention_is_causal() -> None:
+    model = build_temporal_model().eval()
+    anchor_latent = torch.randn(1, 8, 6, 8)
+    target_latents = torch.randn(1, 4, 8, 6, 8)
+    changed_latents = target_latents.clone()
+    changed_latents[:, 2:] += 2.0
+
+    with torch.inference_mode():
+        original_tokens = model.encode(anchor_latent, target_latents)
+        changed_tokens = model.encode(anchor_latent, changed_latents)
+
+    assert torch.allclose(
+        original_tokens[:, :2],
+        changed_tokens[:, :2],
+        atol=1e-6,
+    )
+    assert not torch.allclose(
+        original_tokens[:, 2:],
+        changed_tokens[:, 2:],
+        atol=1e-6,
+    )
+
+
+def test_temporal_attention_ignores_padded_future() -> None:
+    model = build_temporal_model().eval()
+    anchor_latent = torch.randn(1, 8, 6, 8)
+    target_latents = torch.randn(1, 4, 8, 6, 8)
+    padding_mask = torch.tensor([[False, False, True, True]])
+
+    with torch.inference_mode():
+        full_tokens = model.encode(
+            anchor_latent,
+            target_latents,
+            target_padding_mask=padding_mask,
+        )
+        short_tokens = model.encode(
+            anchor_latent,
+            target_latents[:, :2],
+        )
+
+    assert torch.allclose(
+        full_tokens[:, :2],
+        short_tokens,
+        atol=1e-6,
+    )
+
+
+def test_default_model_keeps_legacy_state_dict() -> None:
+    model = build_model()
+
+    assert not any(
+        "temporal" in key or "anchor_context" in key
+        for key in model.state_dict()
+    )
 
 
 def test_invalid_shapes() -> None:

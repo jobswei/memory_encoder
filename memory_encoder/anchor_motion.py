@@ -399,7 +399,10 @@ class AnchorMotionEncoder(nn.Module):
         temporal_block_index = 0
         for layer_index, block in enumerate(self.blocks):
             queries = block(queries, tokens)
-            if layer_index not in self.temporal_insertion_indices:
+            if (
+                self.temporal_attention == "none"
+                or layer_index not in self.temporal_insertion_indices
+            ):
                 continue
             motion_queries = einops.rearrange(
                 queries,

@@ -133,6 +133,88 @@ def test_default_model_keeps_legacy_state_dict() -> None:
     )
 
 
+def build_dynamic_source_model() -> AnchorMotionAutoEncoder:
+    return AnchorMotionAutoEncoder(
+        AnchorMotionConfig(
+            latent_channels=8,
+            hidden_dim=32,
+            num_motion_tokens=4,
+            num_layers=2,
+            num_heads=4,
+            num_position_harmonics=2,
+            temporal_attention="anchor_conditioned",
+            temporal_insertion_indices=[1],
+            anchor_context_size=2,
+            query_source="delta_target_anchor",
+            auxiliary_heads=["dynamic_mask", "anchor_flow"],
+        )
+    )
+
+
+def test_dynamic_source_and_auxiliary_shapes() -> None:
+    model = build_dynamic_source_model()
+    anchor_latent = torch.randn(2, 8, 6, 8)
+    target_latents = torch.randn(2, 4, 8, 6, 8)
+
+    outputs = model(anchor_latent, target_latents)
+
+    assert outputs["motion_tokens"].shape == (2, 4, 4, 32)
+    assert outputs["reconstructed_latents"].shape == (2, 4, 8, 6, 8)
+    assert outputs["dynamic_mask"].shape == (2, 4, 1, 6, 8)
+    assert outputs["anchor_flow"].shape == (2, 4, 2, 6, 8)
+    assert torch.isfinite(outputs["dynamic_mask"]).all()
+    assert torch.isfinite(outputs["anchor_flow"]).all()
+
+
+def test_dynamic_source_keeps_causal_temporal_order() -> None:
+    model = build_dynamic_source_model().eval()
+    anchor_latent = torch.randn(1, 8, 6, 8)
+    target_latents = torch.randn(1, 4, 8, 6, 8)
+    changed_latents = target_latents.clone()
+    changed_latents[:, 2:] += 2.0
+
+    with torch.inference_mode():
+        original_tokens = model.encode(anchor_latent, target_latents)
+        changed_tokens = model.encode(anchor_latent, changed_latents)
+
+    assert torch.allclose(
+        original_tokens[:, :2],
+        changed_tokens[:, :2],
+        atol=1e-6,
+    )
+    assert not torch.allclose(
+        original_tokens[:, 2:],
+        changed_tokens[:, 2:],
+        atol=1e-6,
+    )
+
+
+def test_dynamic_source_checkpoint_roundtrip(tmp_path: Path) -> None:
+    model = build_dynamic_source_model()
+    checkpoint_directory = tmp_path / "checkpoint"
+    model.save_pretrained(checkpoint_directory)
+    loaded_model = AnchorMotionAutoEncoder.from_pretrained(checkpoint_directory)
+    model.eval()
+    loaded_model.eval()
+    anchor_latent = torch.randn(1, 8, 4, 5)
+    target_latents = torch.randn(1, 2, 8, 4, 5)
+
+    with torch.no_grad():
+        outputs = model(anchor_latent, target_latents)
+        loaded_outputs = loaded_model(anchor_latent, target_latents)
+
+    assert torch.allclose(
+        outputs["motion_tokens"],
+        loaded_outputs["motion_tokens"],
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        outputs["anchor_flow"],
+        loaded_outputs["anchor_flow"],
+        atol=1e-6,
+    )
+
+
 def test_invalid_shapes() -> None:
     model = build_model()
     anchor_latent = torch.randn(2, 8, 6, 8)

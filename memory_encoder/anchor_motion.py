@@ -9,7 +9,11 @@ import torch
 import torch.nn as nn
 import yaml
 
-from .config import AnchorMotionConfig
+from .config import (
+    AnchorMotionConfig,
+    VALID_AUXILIARY_HEADS,
+    VALID_QUERY_SOURCES,
+)
 
 
 def _load_checkpoint_config(checkpoint_directory: Path) -> dict[str, Any]:
@@ -157,6 +161,183 @@ class MotionEncoderBlock(nn.Module):
         return queries + self.feed_forward(queries)
 
 
+class SourceCrossAttention(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.memory_norm = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        memory: torch.Tensor,
+    ) -> torch.Tensor:
+        normalized_queries = self.query_norm(queries)
+        normalized_memory = self.memory_norm(memory)
+        return queries + self.attention(
+            normalized_queries,
+            normalized_memory,
+            normalized_memory,
+            need_weights=False,
+        )[0]
+
+
+class LatentProjection(nn.Module):
+
+    def __init__(
+        self,
+        latent_channels: int,
+        hidden_dim: int,
+    ) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Conv2d(latent_channels, hidden_dim, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1),
+            nn.SiLU(),
+        )
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+    ) -> tuple[torch.Tensor, int, int]:
+        features = self.network(latents)
+        tokens = einops.rearrange(
+            features,
+            "b d h w -> b (h w) d",
+        )
+        return tokens, features.shape[-2], features.shape[-1]
+
+
+class DynamicFrameBlock(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.delta_attention = SourceCrossAttention(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+        self.target_attention = SourceCrossAttention(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+        self.anchor_attention = SourceCrossAttention(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+        self.feed_forward = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        delta_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        anchor_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        queries = self.delta_attention(queries, delta_tokens)
+        queries = self.target_attention(queries, target_tokens)
+        queries = self.anchor_attention(queries, anchor_tokens)
+        return queries + self.feed_forward(queries)
+
+
+class AuxiliarySpatialDecoder(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        num_position_harmonics: int,
+        output_channels: int,
+    ) -> None:
+        super().__init__()
+        self.position_encoder = SpatialCoordinateEncoder(
+            hidden_dim=hidden_dim,
+            num_harmonics=num_position_harmonics,
+        )
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.memory_norm = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.feed_forward = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        self.output_head = nn.Linear(hidden_dim, output_channels)
+
+    def forward(
+        self,
+        motion_tokens: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        batch_size, num_targets, _, _ = motion_tokens.shape
+        tokens = einops.rearrange(
+            motion_tokens,
+            "b t k d -> (b t) k d",
+        )
+        queries = self.position_encoder.grid(
+            batch_size=batch_size * num_targets,
+            height=height,
+            width=width,
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        normalized_queries = self.query_norm(queries)
+        normalized_tokens = self.memory_norm(tokens)
+        hidden = queries + self.attention(
+            normalized_queries,
+            normalized_tokens,
+            normalized_tokens,
+            need_weights=False,
+        )[0]
+        hidden = hidden + self.feed_forward(hidden)
+        outputs = self.output_head(hidden)
+        return einops.rearrange(
+            outputs,
+            "(b t) (h w) c -> b t c h w",
+            b=batch_size,
+            t=num_targets,
+            h=height,
+            w=width,
+        )
+
+
 class AnchorContextProjection(nn.Module):
 
     def __init__(
@@ -261,6 +442,24 @@ class AnchorMotionEncoder(nn.Module):
             )
             for _ in range(config.num_layers)
         )
+        self.query_source = config.query_source
+        if self.query_source == "delta_target_anchor":
+            self.target_projection = LatentProjection(
+                latent_channels=config.latent_channels,
+                hidden_dim=config.hidden_dim,
+            )
+            self.anchor_projection = LatentProjection(
+                latent_channels=config.latent_channels,
+                hidden_dim=config.hidden_dim,
+            )
+            self.blocks = nn.ModuleList(
+                DynamicFrameBlock(
+                    hidden_dim=config.hidden_dim,
+                    num_heads=config.num_heads,
+                    dropout=config.dropout,
+                )
+                for _ in range(config.num_layers)
+            )
         self.temporal_attention = config.temporal_attention
         self.temporal_insertion_indices = tuple(
             config.temporal_insertion_indices,
@@ -351,6 +550,39 @@ class AnchorMotionEncoder(nn.Module):
             device=tokens.device,
             dtype=tokens.dtype,
         )
+        target_tokens = None
+        source_anchor_tokens = None
+        if self.query_source == "delta_target_anchor":
+            target_tokens, target_height, target_width = self.target_projection(
+                einops.rearrange(
+                    target_latents,
+                    "b t c h w -> (b t) c h w",
+                )
+            )
+            target_tokens = target_tokens + self.position_encoder.grid(
+                batch_size=target_tokens.shape[0],
+                height=target_height,
+                width=target_width,
+                device=target_tokens.device,
+                dtype=target_tokens.dtype,
+            )
+            source_anchor_tokens, anchor_height, anchor_width = (
+                self.anchor_projection(anchor_latent)
+            )
+            source_anchor_tokens = source_anchor_tokens + (
+                self.position_encoder.grid(
+                    batch_size=source_anchor_tokens.shape[0],
+                    height=anchor_height,
+                    width=anchor_width,
+                    device=source_anchor_tokens.device,
+                    dtype=source_anchor_tokens.dtype,
+                )
+            )
+            source_anchor_tokens = einops.repeat(
+                source_anchor_tokens,
+                "b n d -> (b t) n d",
+                t=num_targets,
+            )
 
         queries = einops.repeat(
             self.motion_queries.weight.to(dtype=tokens.dtype),
@@ -398,7 +630,15 @@ class AnchorMotionEncoder(nn.Module):
 
         temporal_block_index = 0
         for layer_index, block in enumerate(self.blocks):
-            queries = block(queries, tokens)
+            if self.query_source == "delta_target_anchor":
+                queries = block(
+                    queries,
+                    tokens,
+                    target_tokens,
+                    source_anchor_tokens,
+                )
+            else:
+                queries = block(queries, tokens)
             if (
                 self.temporal_attention == "none"
                 or layer_index not in self.temporal_insertion_indices
@@ -542,6 +782,23 @@ class AnchorMotionAutoEncoder(nn.Module):
         self.config = config
         self.encoder = AnchorMotionEncoder(config)
         self.decoder = AnchorMotionDecoder(config)
+        self.auxiliary_heads = tuple(
+            head
+            for head in ("dynamic_mask", "anchor_flow")
+            if head in set(config.auxiliary_heads)
+        )
+        if self.auxiliary_heads:
+            output_channels = sum(
+                2 if head == "anchor_flow" else 1
+                for head in self.auxiliary_heads
+            )
+            self.auxiliary_decoder = AuxiliarySpatialDecoder(
+                hidden_dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                dropout=config.dropout,
+                num_position_harmonics=config.num_position_harmonics,
+                output_channels=output_channels,
+            )
 
     @staticmethod
     def _validate_config(config: AnchorMotionConfig) -> None:
@@ -559,6 +816,16 @@ class AnchorMotionAutoEncoder(nn.Module):
                 raise ValueError(f"{field_name} must be positive")
         if config.dropout < 0.0 or config.dropout >= 1.0:
             raise ValueError("dropout must be in [0.0, 1.0)")
+        if config.query_source not in VALID_QUERY_SOURCES:
+            raise ValueError(
+                "query_source must be delta or delta_target_anchor"
+            )
+        if len(set(config.auxiliary_heads)) != len(config.auxiliary_heads):
+            raise ValueError("auxiliary_heads must contain unique values")
+        if not set(config.auxiliary_heads) <= VALID_AUXILIARY_HEADS:
+            raise ValueError(
+                "auxiliary_heads supports dynamic_mask and anchor_flow"
+            )
         if config.hidden_dim % config.num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
         if config.temporal_attention not in {"none", "anchor_conditioned"}:
@@ -608,6 +875,29 @@ class AnchorMotionAutoEncoder(nn.Module):
             target_padding_mask,
         )
 
+    def decode_auxiliary(
+        self,
+        motion_tokens: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> dict[str, torch.Tensor]:
+        if not self.auxiliary_heads:
+            raise ValueError("auxiliary heads are not enabled")
+        auxiliary_outputs = self.auxiliary_decoder(
+            motion_tokens,
+            height,
+            width,
+        )
+        channel_index = 0
+        outputs = {}
+        for head in self.auxiliary_heads:
+            num_channels = 2 if head == "anchor_flow" else 1
+            outputs[head] = auxiliary_outputs[
+                :, :, channel_index:channel_index + num_channels
+            ]
+            channel_index += num_channels
+        return outputs
+
     def decode(
         self,
         anchor_latent: torch.Tensor,
@@ -634,10 +924,19 @@ class AnchorMotionAutoEncoder(nn.Module):
             target_padding_mask,
         )
         reconstructed_latents = self.decode(anchor_latent, motion_tokens)
-        return {
+        outputs = {
             "motion_tokens": motion_tokens,
             "reconstructed_latents": reconstructed_latents,
         }
+        if self.auxiliary_heads:
+            outputs.update(
+                self.decode_auxiliary(
+                    motion_tokens,
+                    reconstructed_latents.shape[-2],
+                    reconstructed_latents.shape[-1],
+                )
+            )
+        return outputs
 
     def save_pretrained(self, directory: str | Path) -> None:
         output_directory = Path(directory)

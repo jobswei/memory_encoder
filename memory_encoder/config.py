@@ -18,6 +18,8 @@ class AnchorMotionConfig:
         default_factory=lambda: [2, 3],
     )
     anchor_context_size: int = 4
+    query_source: str = "delta"
+    auxiliary_heads: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -26,3 +28,7 @@ class AnchorMotionConfig:
     def from_dict(cls, values: dict[str, Any]) -> AnchorMotionConfig:
         field_names = {field for field in cls.__dataclass_fields__}
         return cls(**{key: value for key, value in values.items() if key in field_names})
+
+
+VALID_QUERY_SOURCES = {"delta", "delta_target_anchor"}
+VALID_AUXILIARY_HEADS = {"dynamic_mask", "anchor_flow"}

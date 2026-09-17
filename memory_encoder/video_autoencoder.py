@@ -206,10 +206,19 @@ class AnchorMotionVideoAutoEncoder(nn.Module):
             latents[:, 1:],
             frame_indices,
         )
-        return {
+        outputs = {
             "anchor_latent": latents[:, 0].contiguous(),
             "motion_tokens": motion_tokens.contiguous(),
         }
+        if self.anchor_motion.auxiliary_heads:
+            outputs.update(
+                self.anchor_motion.decode_auxiliary(
+                    motion_tokens,
+                    latents.shape[-2],
+                    latents.shape[-1],
+                )
+            )
+        return outputs
 
     @torch.inference_mode()
     def decode_video(

@@ -7,6 +7,7 @@ from typing import Any
 import einops
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 
 from .config import (
@@ -828,6 +829,11 @@ class AnchorMotionAutoEncoder(nn.Module):
             )
         if config.hidden_dim % config.num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
+        if (
+            config.dynamic_mask_size is not None
+            and config.dynamic_mask_size <= 0
+        ):
+            raise ValueError("dynamic_mask_size must be positive or null")
         if config.temporal_attention not in {"none", "anchor_conditioned"}:
             raise ValueError(
                 "temporal_attention must be none or anchor_conditioned"
@@ -892,9 +898,37 @@ class AnchorMotionAutoEncoder(nn.Module):
         outputs = {}
         for head in self.auxiliary_heads:
             num_channels = 2 if head == "anchor_flow" else 1
-            outputs[head] = auxiliary_outputs[
+            head_output = auxiliary_outputs[
                 :, :, channel_index:channel_index + num_channels
             ]
+            if (
+                head == "dynamic_mask"
+                and self.config.dynamic_mask_size is not None
+                and head_output.shape[-2:] != (
+                    self.config.dynamic_mask_size,
+                    self.config.dynamic_mask_size,
+                )
+            ):
+                flattened_output = einops.rearrange(
+                    head_output,
+                    "b t c h w -> (b t) c h w",
+                )
+                flattened_output = F.interpolate(
+                    flattened_output,
+                    size=(
+                        self.config.dynamic_mask_size,
+                        self.config.dynamic_mask_size,
+                    ),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                head_output = einops.rearrange(
+                    flattened_output,
+                    "(b t) c h w -> b t c h w",
+                    b=head_output.shape[0],
+                    t=head_output.shape[1],
+                )
+            outputs[head] = head_output
             channel_index += num_channels
         return outputs
 

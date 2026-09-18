@@ -147,6 +147,7 @@ def build_dynamic_source_model() -> AnchorMotionAutoEncoder:
             anchor_context_size=2,
             query_source="delta_target_anchor",
             auxiliary_heads=["dynamic_mask", "anchor_flow"],
+            dynamic_mask_size=12,
         )
     )
 
@@ -160,7 +161,7 @@ def test_dynamic_source_and_auxiliary_shapes() -> None:
 
     assert outputs["motion_tokens"].shape == (2, 4, 4, 32)
     assert outputs["reconstructed_latents"].shape == (2, 4, 8, 6, 8)
-    assert outputs["dynamic_mask"].shape == (2, 4, 1, 6, 8)
+    assert outputs["dynamic_mask"].shape == (2, 4, 1, 12, 12)
     assert outputs["anchor_flow"].shape == (2, 4, 2, 6, 8)
     assert torch.isfinite(outputs["dynamic_mask"]).all()
     assert torch.isfinite(outputs["anchor_flow"]).all()

@@ -20,6 +20,7 @@ class AnchorMotionConfig:
     anchor_context_size: int = 4
     query_source: str = "delta"
     auxiliary_heads: list[str] = field(default_factory=list)
+    dynamic_mask_size: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

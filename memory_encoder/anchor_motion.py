@@ -201,14 +201,15 @@ class LatentProjection(nn.Module):
         self,
         latent_channels: int,
         hidden_dim: int,
+        strides: tuple[int, int] = (2, 2),
     ) -> None:
         super().__init__()
         self.network = nn.Sequential(
             nn.Conv2d(latent_channels, hidden_dim, 3, padding=1),
             nn.SiLU(),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=strides[0], padding=1),
             nn.SiLU(),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=strides[1], padding=1),
             nn.SiLU(),
         )
 
@@ -416,13 +417,14 @@ class AnchorMotionEncoder(nn.Module):
         super().__init__()
         self.num_motion_tokens = config.num_motion_tokens
         self.anchor_context_size = config.anchor_context_size
+        strides = tuple(config.spatial_downsample_strides)
         self.input_projection = nn.Sequential(
             nn.Conv2d(config.latent_channels, 64, 3, padding=1),
             nn.SiLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.Conv2d(64, 128, 3, stride=strides[0], padding=1),
             nn.GroupNorm(8, 128),
             nn.SiLU(),
-            nn.Conv2d(128, config.hidden_dim, 3, stride=2, padding=1),
+            nn.Conv2d(128, config.hidden_dim, 3, stride=strides[1], padding=1),
             nn.GroupNorm(8, config.hidden_dim),
             nn.SiLU(),
         )
@@ -448,10 +450,12 @@ class AnchorMotionEncoder(nn.Module):
             self.target_projection = LatentProjection(
                 latent_channels=config.latent_channels,
                 hidden_dim=config.hidden_dim,
+                strides=strides,
             )
             self.anchor_projection = LatentProjection(
                 latent_channels=config.latent_channels,
                 hidden_dim=config.hidden_dim,
+                strides=strides,
             )
             self.blocks = nn.ModuleList(
                 DynamicFrameBlock(
@@ -834,6 +838,13 @@ class AnchorMotionAutoEncoder(nn.Module):
             and config.dynamic_mask_size <= 0
         ):
             raise ValueError("dynamic_mask_size must be positive or null")
+        strides = config.spatial_downsample_strides
+        if len(strides) != 2 or any(
+            stride not in (1, 2) for stride in strides
+        ):
+            raise ValueError(
+                "spatial_downsample_strides must contain two values in {1, 2}"
+            )
         if config.temporal_attention not in {"none", "anchor_conditioned"}:
             raise ValueError(
                 "temporal_attention must be none or anchor_conditioned"

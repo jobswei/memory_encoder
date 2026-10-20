@@ -21,6 +21,9 @@ class AnchorMotionConfig:
     query_source: str = "delta"
     auxiliary_heads: list[str] = field(default_factory=list)
     dynamic_mask_size: int | None = None
+    spatial_downsample_strides: list[int] = field(
+        default_factory=lambda: [2, 2],
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -66,7 +66,7 @@ def _detect_diffusers_vae_type(vae_path: Path) -> str | None:
         return "wan"
     if model_class == "AutoencoderKLTemporalDecoder":
         return "svd"
-    if str(config.get("model_type", "")) == "qwen3_5_vision":
+    if str(config.get("model_type", "")) in {"qwen3_5_vision", "qwen3_5"}:
         return "qwen3_5"
     return None
 

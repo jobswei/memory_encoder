@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import einops
@@ -43,19 +44,60 @@ class Qwen35VisionTowerEncoder(nn.Module):
         return next(self.model.parameters()).dtype
 
 
+def _load_vision_tower_weights(tower_path: Path):
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    extracted_path = tower_path / "vision_tower.safetensors"
+    if extracted_path.is_file():
+        from transformers import Qwen3_5VisionConfig
+
+        config = Qwen3_5VisionConfig.from_pretrained(tower_path)
+        return config, load_file(extracted_path)
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(tower_path).vision_config
+    prefix = "model.visual."
+    index_path = tower_path / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = index["weight_map"]
+    elif (tower_path / "model.safetensors").is_file():
+        with safe_open(
+            tower_path / "model.safetensors", framework="pt"
+        ) as handle:
+            weight_map = {
+                key: "model.safetensors" for key in handle.keys()
+            }
+    else:
+        raise FileNotFoundError(
+            f"{tower_path} contains neither vision_tower.safetensors "
+            "nor a full Qwen3.5 checkpoint (model.safetensors[.index.json])"
+        )
+    shard_keys: dict[str, list[str]] = {}
+    for key, shard in weight_map.items():
+        if key.startswith(prefix):
+            shard_keys.setdefault(shard, []).append(key)
+    if not shard_keys:
+        raise ValueError(f"no '{prefix}*' weights found in {tower_path}")
+    state_dict = {}
+    for shard, keys in shard_keys.items():
+        with safe_open(tower_path / shard, framework="pt") as handle:
+            for key in keys:
+                state_dict[key.removeprefix(prefix)] = handle.get_tensor(key)
+    return config, state_dict
+
+
 def load_qwen3_5_vision_tower(
     tower_path: str | Path,
     stats_path: str | Path | None = None,
     device: str | torch.device = "cpu",
     torch_dtype: torch.dtype = torch.float32,
 ) -> Qwen35VisionTowerEncoder:
-    from safetensors.torch import load_file
-    from transformers import Qwen3_5VisionConfig, Qwen3_5VisionModel
+    from transformers import Qwen3_5VisionModel
 
-    tower_path = Path(tower_path)
-    config = Qwen3_5VisionConfig.from_pretrained(tower_path)
+    config, state_dict = _load_vision_tower_weights(Path(tower_path))
     model = Qwen3_5VisionModel(config)
-    state_dict = load_file(tower_path / "vision_tower.safetensors")
     model.load_state_dict(state_dict, strict=True)
     model = model.to(device=device, dtype=torch_dtype)
     feature_mean = None

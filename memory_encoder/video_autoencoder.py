@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from .anchor_motion import AnchorMotionAutoEncoder, _load_checkpoint_config
+from .qwen3_5_vision import encode_qwen3_5_frames, load_qwen3_5_vision_tower
 from .svd_vae import decode_svd_latents, encode_svd_frames, load_svd_vae
 from .wan_vae import (
     decode_wan_video,
@@ -23,7 +24,7 @@ from .wan22_vae import (
 )
 
 
-SUPPORTED_VAE_TYPES = {"svd", "wan", "wan22"}
+SUPPORTED_VAE_TYPES = {"svd", "wan", "wan22", "qwen3_5"}
 
 
 def _vae_device(vae: nn.Module) -> torch.device:
@@ -65,6 +66,8 @@ def _detect_diffusers_vae_type(vae_path: Path) -> str | None:
         return "wan"
     if model_class == "AutoencoderKLTemporalDecoder":
         return "svd"
+    if str(config.get("model_type", "")) == "qwen3_5_vision":
+        return "qwen3_5"
     return None
 
 
@@ -124,6 +127,7 @@ class AnchorMotionVideoAutoEncoder(nn.Module):
         device: str | torch.device = "cpu",
         torch_dtype: torch.dtype = torch.float32,
         encode_batch_size: int = 32,
+        stats_path: str | Path | None = None,
     ) -> AnchorMotionVideoAutoEncoder:
         checkpoint_config = _load_checkpoint_config(Path(anchor_checkpoint))
         vae_type = _resolve_vae_type(checkpoint_config, vae_path)
@@ -131,6 +135,19 @@ class AnchorMotionVideoAutoEncoder(nn.Module):
             anchor_checkpoint,
             map_location=device,
         )
+        if vae_type == "qwen3_5":
+            vae = load_qwen3_5_vision_tower(
+                vae_path,
+                stats_path=stats_path,
+                device=device,
+                torch_dtype=torch_dtype,
+            )
+            return cls(
+                anchor_motion.to(device=device, dtype=torch_dtype),
+                vae,
+                vae_type=vae_type,
+                encode_batch_size=encode_batch_size,
+            )
         vae_loaders = {
             "svd": load_svd_vae,
             "wan": load_wan_vae,
@@ -184,6 +201,12 @@ class AnchorMotionVideoAutoEncoder(nn.Module):
                 frames,
                 self.encode_batch_size,
             )
+        elif self.vae_type == "qwen3_5":
+            latents = encode_qwen3_5_frames(
+                self.vae,
+                frames,
+                self.encode_batch_size,
+            )
         elif self.vae_type == "wan":
             latents = encode_wan_video(
                 self.vae,
@@ -227,6 +250,11 @@ class AnchorMotionVideoAutoEncoder(nn.Module):
         motion_tokens: torch.Tensor,
         num_frames: int | None = None,
     ) -> torch.Tensor:
+        if self.vae_type == "qwen3_5":
+            raise NotImplementedError(
+                "The qwen3_5 vision tower has no pixel decoder; "
+                "motion tokens are the final representation"
+            )
         target_latents = self.anchor_motion.decode(
             anchor_latent,
             motion_tokens,

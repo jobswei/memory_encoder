@@ -44,7 +44,63 @@ class Qwen35VisionTowerEncoder(nn.Module):
         return next(self.model.parameters()).dtype
 
 
+def _resolve_vision_config(tower_path: Path):
+    """Vision config from a native Qwen3.5 checkpoint or a wrapped one.
+
+    Supports both ``vision_config`` (native Qwen3.5 layout) and
+    ``backbone_config.vision_config`` (wrapped layouts such as SimpleMemVLA,
+    where the full Qwen3.5 model sits under a ``backbone.`` prefix).
+    """
+    from transformers import AutoConfig, Qwen3_5VisionConfig
+
+    vision_config = None
+    try:
+        config = AutoConfig.from_pretrained(tower_path)
+    except Exception:
+        config = None
+    if config is not None:
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is not None and not isinstance(
+            vision_config, Qwen3_5VisionConfig
+        ):
+            vision_config = None
+    if vision_config is None:
+        raw = json.loads(
+            (tower_path / "config.json").read_text(encoding="utf-8")
+        )
+        vision_dict = raw.get("vision_config")
+        if vision_dict is None:
+            backbone_dict = raw.get("backbone_config")
+            if isinstance(backbone_dict, dict):
+                vision_dict = backbone_dict.get("vision_config")
+        if vision_dict is None:
+            raise ValueError(
+                f"no vision_config found in {tower_path} (looked for "
+                "'vision_config' and 'backbone_config.vision_config')"
+            )
+        vision_config = Qwen3_5VisionConfig.from_dict(vision_dict)
+    return vision_config
+
+
+def _resolve_visual_prefix(weight_map: dict) -> str:
+    """Key prefix of the vision tower inside the checkpoint.
+
+    Native Qwen3.5 checkpoints use ``model.visual.``; wrapped checkpoints
+    such as SimpleMemVLA use ``backbone.model.visual.``.
+    """
+    for candidate in ("model.visual.", "backbone.model.visual."):
+        if any(key.startswith(candidate) for key in weight_map):
+            return candidate
+    for key in weight_map:
+        if ".visual." in key:
+            return key[: key.index(".visual.") + len(".visual.")]
+    raise ValueError(
+        "no vision-tower weights ('*visual.*') found in the checkpoint"
+    )
+
+
 def _load_vision_tower_weights(tower_path: Path):
+    tower_path = Path(tower_path)
     from safetensors import safe_open
     from safetensors.torch import load_file
 
@@ -54,10 +110,7 @@ def _load_vision_tower_weights(tower_path: Path):
 
         config = Qwen3_5VisionConfig.from_pretrained(tower_path)
         return config, load_file(extracted_path)
-    from transformers import AutoConfig
-
-    config = AutoConfig.from_pretrained(tower_path).vision_config
-    prefix = "model.visual."
+    config = _resolve_vision_config(tower_path)
     index_path = tower_path / "model.safetensors.index.json"
     if index_path.is_file():
         index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -74,12 +127,15 @@ def _load_vision_tower_weights(tower_path: Path):
             f"{tower_path} contains neither vision_tower.safetensors "
             "nor a full Qwen3.5 checkpoint (model.safetensors[.index.json])"
         )
+    prefix = _resolve_visual_prefix(weight_map)
     shard_keys: dict[str, list[str]] = {}
     for key, shard in weight_map.items():
         if key.startswith(prefix):
             shard_keys.setdefault(shard, []).append(key)
     if not shard_keys:
-        raise ValueError(f"no '{prefix}*' weights found in {tower_path}")
+        raise ValueError(
+            f"no '{prefix}*' weights found in {tower_path}"
+        )
     state_dict = {}
     for shard, keys in shard_keys.items():
         with safe_open(tower_path / shard, framework="pt") as handle:
